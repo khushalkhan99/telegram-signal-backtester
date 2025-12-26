@@ -1,8 +1,19 @@
 import streamlit as st
+import sys
+import os
 
-st.set_page_config(layout="wide")
-st.title("🚀 Telegram Trading Backtester")
-st.write("App is loading...")#!/usr/bin/env python3
+# Set page config FIRST
+st.set_page_config(
+    page_title="Telegram Backtester",
+    page_icon="🚀",
+    layout="wide"
+)
+
+# Add a visible element immediately
+st.title("🚀 Telegram Signal Backtester")
+st.write("Initializing application...")
+
+# Then your existing code continues...
 """
 🚀 Telegram Signal Backtester - Launcher
 Beautiful Streamlit interface for crypto signal backtesting
