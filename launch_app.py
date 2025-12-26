@@ -1,4 +1,8 @@
-#!/usr/bin/env python3
+import streamlit as st
+
+st.set_page_config(layout="wide")
+st.title("🚀 Telegram Trading Backtester")
+st.write("App is loading...")#!/usr/bin/env python3
 """
 🚀 Telegram Signal Backtester - Launcher
 Beautiful Streamlit interface for crypto signal backtesting
