@@ -1,0 +1,243 @@
+﻿# src/single_trade_sim_partial_mc.py  (emit STATS incl. MC for Solana)
+import sys, time
+from datetime import datetime, timezone
+import httpx, re
+
+API_ROOT = "https://api.geckoterminal.com/api/v2"
+NETWORKS = ["solana","bsc","eth","base"]
+SOL_RPC = "https://api.mainnet-beta.solana.com"
+
+def http_get(url, params=None):
+    r = httpx.get(url, params=params or {}, headers={"accept":"application/json"}, timeout=30)
+    r.raise_for_status()
+    return r.json()
+
+def detect_network_and_pool(mint: str):
+    for net in NETWORKS:
+        js = http_get(f"{API_ROOT}/networks/{net}/tokens/{mint}/pools", {"page":1})
+        data = js.get("data") or []
+        if data:
+            addr = data[0].get("attributes", {}).get("address")
+            if addr:
+                return net, addr
+    raise RuntimeError("No pools found across solana/bsc/eth/base for this mint")
+
+def fetch_ohlcv_1m_last_48h(network: str, pool: str):
+    url = f"{API_ROOT}/networks/{network}/pools/{pool}/ohlcv/minute"
+    out = []
+    now = int(time.time()); cutoff = now - 48*60*60
+    before = now + 60
+    for _ in range(6):
+        js = http_get(url, {"aggregate":1, "limit":500, "before_timestamp": before})
+        attrs = (js.get("data") or {}).get("attributes", {}) 
+        lst = attrs.get("ohlcv_list") or []
+        if not lst: break
+        out.extend(lst)
+        oldest = int(lst[0][0])
+        before = oldest
+        if oldest <= cutoff: break
+        time.sleep(0.25)
+    out.sort(key=lambda r: int(r[0]))
+    return [r for r in out if int(r[0]) >= cutoff]
+
+def find_entry_minute(candles, hh: int, mm: int):
+    target_ts = None
+    now = int(time.time()); cutoff = now - 48*60*60
+    for ts, *_ in candles:
+        t = datetime.fromtimestamp(int(ts), tz=timezone.utc)
+        if t.hour == hh and t.minute == mm and cutoff <= int(ts) <= now:
+            target_ts = int(ts)
+    return target_ts
+
+def parse_mc(s: str) -> float:
+    mults = {"":1,"k":1_000,"m":1_000_000,"b":1_000_000_000,"t":1_000_000_000_000}
+    raw = s.strip().lower().replace(",", "").replace("$","")
+    m = re.fullmatch(r"\s*([0-9]*\.?[0-9]+)\s*([kmbt]?)\s*", raw)
+    if not m: raise ValueError(f"cannot parse MC: {s!r}")
+    num = float(m.group(1)); suf = m.group(2) or ""
+    return num * mults.get(suf, 1)
+
+def fetch_spl_total_supply(mint: str) -> float:
+    payload = {"jsonrpc":"2.0","id":1,"method":"getTokenSupply","params":[mint]}
+    r = httpx.post(SOL_RPC, json=payload, headers={"accept":"application/json"}, timeout=30)
+    r.raise_for_status()
+    j = r.json()
+    val = (((j.get("result") or {}).get("value")) or {})
+    ui = val.get("uiAmount")
+    if ui is not None:
+        return float(ui)
+    amount = val.get("amount"); dec = val.get("decimals")
+    if amount is not None and dec is not None:
+        return float(amount) / (10 ** int(dec))
+    raise RuntimeError("Could not get SPL total supply")
+
+def entry_fill_with_mc(network, mint, mc_str, o,h,l,c, fallback_mode: str):
+    lo, hi = float(l), float(h)
+    def mode_fill():
+        op, cl = float(o), float(c)
+        rng_up = max(0.0, hi - op); rng_dn = max(0.0, op - lo)
+        is_green = cl >= op
+        if fallback_mode == "optimistic": raw = op
+        elif fallback_mode == "realistic": raw = op + (0.30*rng_up if is_green else -0.30*rng_dn)
+        elif fallback_mode == "pessimistic": raw = hi
+        else: raise RuntimeError("mode must be optimistic|realistic|pessimistic")
+        return max(lo, min(hi, raw))
+    if network != "solana" or not mc_str: return mode_fill(), "MODE", None
+    try:
+        mc_val = parse_mc(mc_str)
+        supply = fetch_spl_total_supply(mint)
+        price = mc_val / supply if supply > 0 else None
+    except Exception:
+        return mode_fill(), "MODE", None
+    if price is not None and lo <= price <= hi:
+        return float(price), "MC", supply
+    return mode_fill(), "MODE", supply
+
+def apply_buy_costs(px, slip=0.03, fee=1.0):  return px*(1+slip), fee
+def apply_sell_costs(px, slip=0.03, fee=1.0): return px*(1-slip), fee
+
+def decide_order_when_both(tp_px, sl_px, paid_entry, mode):
+    if mode == "optimistic":   return ("TP","SL")
+    if mode == "pessimistic":  return ("SL","TP")
+    d_tp = abs(tp_px - paid_entry); d_sl = abs(paid_entry - sl_px)
+    return ("TP","SL") if d_tp <= d_sl else ("SL","TP")
+
+def simulate_partial_tps(candles, start_idx, paid_entry, tp_prices, tp_sizes, sl_price, mode):
+    tps = [(p,s) for (p,s) in zip(tp_prices, tp_sizes) if s > 0]
+    tps.sort(key=lambda x: x[0])
+    remaining_pct = 100.0
+    fills = []
+    for r in candles[start_idx:]:
+        ts_i, o_i,h_i,l_i,c_i = int(r[0]), float(r[1]), float(r[2]), float(r[3]), float(r[4])
+        hit_tp_any = any(h_i >= tp for tp,_ in tps)
+        hit_sl = l_i <= sl_price
+        if not hit_tp_any and not hit_sl:
+            continue
+        if hit_tp_any and not hit_sl:
+            for tp_px, tp_sz in tps:
+                if remaining_pct <= 0: break
+                if h_i >= tp_px:
+                    portion = min(tp_sz, remaining_pct)
+                    recv, _ = apply_sell_costs(tp_px)
+                    fills.append((ts_i, f"TP@{tp_px:.6f}", portion/100.0, tp_px, recv))
+                    remaining_pct -= portion
+            if remaining_pct <= 0: break
+            continue
+        if hit_sl and not hit_tp_any:
+            portion = remaining_pct
+            recv, _ = apply_sell_costs(sl_price)
+            fills.append((ts_i, f"SL@{sl_price:.6f}", portion/100.0, sl_price, recv))
+            remaining_pct = 0.0
+            break
+        reached = [tp for tp,_ in tps if h_i >= tp]
+        nearest_tp = min(reached, key=lambda x: abs(x - paid_entry)) if reached else None
+        first, second = decide_order_when_both(nearest_tp, sl_price, paid_entry, mode)
+        if first == "TP":
+            for tp_px, tp_sz in tps:
+                if remaining_pct <= 0: break
+                if h_i >= tp_px:
+                    portion = min(tp_sz, remaining_pct)
+                    recv, _ = apply_sell_costs(tp_px)
+                    fills.append((ts_i, f"TP@{tp_px:.6f}", portion/100.0, tp_px, recv))
+                    remaining_pct -= portion
+            if remaining_pct > 0 and l_i <= sl_price:
+                portion = remaining_pct
+                recv, _ = apply_sell_costs(sl_price)
+                fills.append((ts_i, f"SL@{sl_price:.6f}", portion/100.0, sl_price, recv))
+                remaining_pct = 0.0
+                break
+        else:
+            portion = remaining_pct
+            recv, _ = apply_sell_costs(sl_price)
+            fills.append((ts_i, f"SL@{sl_price:.6f}", portion/100.0, sl_price, recv))
+            remaining_pct = 0.0
+            break
+    return fills, remaining_pct
+
+def fmt_usd(x): return f"${x:,.2f}"
+
+def main():
+    if len(sys.argv) < 10:
+        print("Usage: python src/single_trade_sim_partial_mc.py <mint> <HH:MM_UTC> <mc> <invest_usd> <tp1_up_pct> <tp1_size_pct> <tp2_up_pct> <tp2_size_pct> <sl_down_pct> [mode]")
+        sys.exit(1)
+
+    mint = sys.argv[1].strip()
+    hhmm = sys.argv[2].strip()
+    mc_str = sys.argv[3].strip()
+    invest = float(sys.argv[4])
+    tp1_up = float(sys.argv[5])/100.0
+    tp1_sz = float(sys.argv[6])
+    tp2_up = float(sys.argv[7])/100.0
+    tp2_sz = float(sys.argv[8])
+    sl_dn  = float(sys.argv[9])/100.0
+    mode = sys.argv[10] if len(sys.argv) > 10 else "realistic"
+
+    hh, mm = [int(x) for x in hhmm.split(":")]
+
+    net, pool = detect_network_and_pool(mint)
+    candles = fetch_ohlcv_1m_last_48h(net, pool)
+    if not candles:
+        print("No candles in last 48h."); sys.exit(2)
+    entry_ts = find_entry_minute(candles, hh, mm)
+    if not entry_ts:
+        print("No candle found at that HH:MM within last 48h."); sys.exit(3)
+    idx = next(i for i,r in enumerate(candles) if int(r[0])==entry_ts)
+    e = candles[idx]; ts,o,h,l,c = int(e[0]), float(e[1]), float(e[2]), float(e[3]), float(e[4])
+    e_dt = datetime.fromtimestamp(ts, tz=timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+
+    raw_entry, how, supply = entry_fill_with_mc(net, mint, mc_str, o,h,l,c, mode)
+    paid_entry, buy_fee = apply_buy_costs(raw_entry, 0.03, 1.0)
+    qty = invest / paid_entry
+
+    tp_prices = [ paid_entry*(1+tp1_up), paid_entry*(1+tp2_up) ]
+    tp_sizes  = [ tp1_sz, tp2_sz ]
+    sl_price  = paid_entry*(1-sl_dn)
+
+    fills, remaining_pct = simulate_partial_tps(candles, idx, paid_entry, tp_prices, tp_sizes, sl_price, mode)
+    if remaining_pct > 0:
+        last = candles[-1]
+        ts_x = int(last[0]); px = float(last[4])
+        recv, _ = apply_sell_costs(px)
+        fills.append((ts_x, "TIMEOUT(48h)", remaining_pct/100.0, px, recv))
+        remaining_pct = 0.0
+
+    # proceeds & stats
+    proceeds = 0.0; sell_fee_total = 0.0
+    w_exit_raw, w_sum = 0.0, 0.0
+    last_reason = ""
+    for ts_x, reason, frac, raw_px, recv_px in fills:
+        sub_qty = qty * frac
+        proceeds += sub_qty * recv_px
+        sell_fee_total += 1.0
+        w_exit_raw += frac * raw_px
+        w_sum += frac
+        last_reason = reason
+    exit_raw_avg = (w_exit_raw / w_sum) if w_sum > 0 else raw_entry
+
+    pnl_usd = proceeds - invest - buy_fee - sell_fee_total
+    ret_pct = (proceeds - invest) / invest * 100.0
+
+    # duration
+    exit_ts = int(fills[-1][0]) if fills else int(candles[idx][0])
+    x_dt = datetime.fromtimestamp(exit_ts, tz=timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+    hold_min = (exit_ts - int(candles[idx][0])) // 60
+
+    # ATH since entry (within 48h window)
+    max_high = max(float(r[2]) for r in candles[idx:])
+    ath_mult = (max_high / raw_entry) if raw_entry > 0 else 0.0
+
+    print(f"Mint: {mint} | Net: {net} | Pool: {pool}")
+    print(f"Entry @ {e_dt}  raw:{raw_entry:.8f} [{how}]  paid(3%+$1): {paid_entry:.8f}  qty:{qty:.8f}")
+    for ts_x, reason, frac, raw_px, recv_px in fills:
+        tstr = datetime.fromtimestamp(ts_x, tz=timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+        print(f"- Exit {reason:<14} @ {tstr}  raw:{raw_px:.8f}  recv(3% slip):{recv_px:.8f}  part:{frac*100:.1f}%")
+    print(f"Proceeds: ${proceeds:,.2f}  | Buy fee: $1.00  | Sell fee count: {len(fills)} ($ {len(fills):.2f})")
+    print(f"PNL: ${pnl_usd:,.2f}   Return: {ret_pct:.2f}%")
+    # STATS (include MC fields if Solana + supply available)
+    entry_mc = exit_mc = ""
+    if net == "solana" and supply:
+        entry_mc = f"{raw_entry * float(supply):.8f}"
+        exit_mc  = f"{exit_raw_avg * float(supply):.8f}"
+    print(f"STATS: net={net} entry_raw={raw_entry:.8f} exit_raw_avg={exit_raw_avg:.8f} max_high={max_high:.8f} ath_mult={ath_mult:.6f} invest={invest} mode={mode} hold_min={hold_min} pnl_usd={pnl_usd:.8f} pnl_token={pnl_usd/raw_entry:.8f} exit_reason={last_reason} entry_mc={entry_mc} exit_mc={exit_mc}")
+if __name__ == "__main__":
+    main()

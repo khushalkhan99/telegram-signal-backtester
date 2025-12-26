@@ -1,0 +1,3 @@
+mint,net,time_hhmm_utc,mc,invest_usd,mode,pnl_usd,return_pct,entry_dt_utc,exit_dt_utc,exit_reason,hold_min,entry_raw,exit_raw_avg,ath_mult,pnl_token,entry_mc,exit_mc
+EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v,solana,12:55,,100.0,realistic,-5.97,-3.97,2025-09-30 12:55:00 UTC,2025-09-30 12:55:00 UTC,SL,0,1.23143994,1.25569931,1.001498,-4.84798307,,
+EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v,solana,12:55,12.34m,100.0,realistic,-5.97,-3.97,2025-09-30 12:55:00 UTC,2025-09-30 12:55:00 UTC,SL@1.255699,0,1.23143994,1.25569931,1.001498,-4.84798307,13408694529.09480667,13672845811.31797409
